@@ -11,6 +11,7 @@
  *   ~2 KB   HAL handles, globals, main stack
  */
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +33,28 @@
 SPI_HandleTypeDef hspi1;
 I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
+
+// Console output: one whole line per call, serialised between tasks.
+static SemaphoreHandle_t g_log_mutex;
+
+static void log_printf(const char *fmt, ...)
+{
+    static char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0 || g_log_mutex == NULL) {
+        return;
+    }
+    if (n > (int)sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;
+    }
+    if (xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        HAL_UART_Transmit(&LOG_UART_HANDLE, (uint8_t *)buf, (uint16_t)n, 100);
+        xSemaphoreGive(g_log_mutex);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -428,7 +451,7 @@ static void display_task(void *arg)
 #endif
 
     draw_all();
-    printf("[lcd] ST7789 240x280 initialised\r\n");
+    log_printf("[lcd] ST7789 240x280 initialised\r\n");
 
     uint32_t ticks = 0;
     for (;;) {
@@ -506,7 +529,7 @@ static void supervisor_task(void *arg)
         if (++tick10 >= 10) {
             tick10 = 0;
             g_sup_stack_hw = uxTaskGetStackHighWaterMark(NULL);
-            printf("[sup] up %lus bands %lu scd %lu/%lu heap %u sup_hw %lu\r\n",
+            log_printf("[sup] up %lus bands %lu scd %lu/%lu heap %u sup_hw %lu\r\n",
                    (unsigned long)(xTaskGetTickCount() / 1000U), (unsigned long)g_lcd_bands,
                    (unsigned long)g_scd_ok_reads, (unsigned long)g_scd_reads,
                    (unsigned)xPortGetFreeHeapSize(), (unsigned long)g_sup_stack_hw);
@@ -524,11 +547,11 @@ static void sensor_task(void *arg)
             g_sensor_ok = true;
             uint64_t serial = 0;
             if (scd41_serial(&serial) == 0) {
-                printf("[scd] SCD41 serial %08lX%04lX\r\n", (unsigned long)(serial >> 16),
+                log_printf("[scd] SCD41 serial %08lX%04lX\r\n", (unsigned long)(serial >> 16),
                        (unsigned long)(serial & 0xFFFF));
             }
             if (scd41_start_periodic() == 0) {
-                printf("[scd] periodic measurement started (first value in ~5 s)\r\n");
+                log_printf("[scd] periodic measurement started (first value in ~5 s)\r\n");
             }
 
             for (;;) {
@@ -543,16 +566,16 @@ static void sensor_task(void *arg)
                     g_ui_dirty = true;
                     hist_push(m.co2_ppm);
                     g_scd_ok_reads++;
-                    printf("[scd] CO2 %u ppm, T %d.%d C, RH %d.%d %%\r\n", (unsigned)m.co2_ppm,
+                    log_printf("[scd] CO2 %u ppm, T %d.%d C, RH %d.%d %%\r\n", (unsigned)m.co2_ppm,
                            (int)m.temperature_c, (int)(m.temperature_c * 10) % 10,
                            (int)m.humidity_rh, (int)(m.humidity_rh * 10) % 10);
                 } else {
-                    printf("[scd] read failed\r\n");
+                    log_printf("[scd] read failed\r\n");
                     // A stuck bus can hold SDA low; re-init the peripheral.
                     static int fails;
                     if (++fails >= 3) {
                         fails = 0;
-                        printf("[scd] I2C stuck, re-initialising\r\n");
+                        log_printf("[scd] I2C stuck, re-initialising\r\n");
                         HAL_I2C_DeInit(&hi2c1);
                         HAL_I2C_Init(&hi2c1);
                     }
@@ -563,7 +586,7 @@ static void sensor_task(void *arg)
         }
 
         g_sensor_ok = false;
-        printf("[scd] sensor not found on I2C1 (PB6/PB7), retrying\r\n");
+        log_printf("[scd] sensor not found on I2C1 (PB6/PB7), retrying\r\n");
         g_scd_reads++;
         g_scd_stack_hw = uxTaskGetStackHighWaterMark(NULL);
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -784,9 +807,14 @@ int main(void)
         Error_Handler();
     }
 
+    g_log_mutex = xSemaphoreCreateMutex();
+    if (g_log_mutex == NULL) {
+        Error_Handler();
+    }
+
     xTaskCreate(display_task, "lcd", 320, NULL, 2, NULL);
     xTaskCreate(sensor_task, "scd", 384, NULL, 3, NULL);
-    xTaskCreate(supervisor_task, "sup", 256, NULL, 1, NULL);
+    xTaskCreate(supervisor_task, "sup", 320, NULL, 1, NULL);
 
     // IWDG last: ~4 s at LSI 40 kHz, frozen while the core is halted by a
     // debugger so SWD inspection does not reset the board.
