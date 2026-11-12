@@ -74,6 +74,9 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 #define COL_WARN rgb565(242, 201, 76)
 #define COL_BAD rgb565(242, 153, 74)
 #define COL_ALARM rgb565(235, 87, 87)
+#define COL_GRAPH_BG rgb565(14, 22, 34)
+#define COL_GRAPH_FILL rgb565(24, 70, 55)
+#define COL_GRAPH_GRID rgb565(32, 46, 62)
 
 // ---------------------------------------------------------------------------
 // Drawing helpers working on one band
@@ -126,6 +129,27 @@ static void draw_text_center(uint16_t *buf, int by, int bh, int y, const char *s
 // Dashboard
 // ---------------------------------------------------------------------------
 static volatile bool g_ui_dirty = true;
+
+// CO2 history for the trend graph: 48 samples x 5 s = 4 minutes.
+#define GRAPH_SAMPLES 48
+static uint16_t g_hist[GRAPH_SAMPLES];
+static uint8_t g_hist_len;
+static uint8_t g_hist_pos;
+
+static void hist_push(uint16_t ppm)
+{
+    g_hist[g_hist_pos] = ppm;
+    g_hist_pos = (uint8_t)((g_hist_pos + 1) % GRAPH_SAMPLES);
+    if (g_hist_len < GRAPH_SAMPLES) {
+        g_hist_len++;
+    }
+}
+
+static uint16_t hist_get(int i)
+{
+    int idx = (g_hist_pos + GRAPH_SAMPLES - g_hist_len + i) % GRAPH_SAMPLES;
+    return g_hist[idx];
+}
 
 static uint16_t co2_color(uint16_t ppm)
 {
@@ -180,6 +204,109 @@ static void draw_card(uint16_t *buf, int by, int bh, int x, int y, int w, int h,
     draw_text(buf, by, bh, x + 10 + ipw + 16, y + 50, unit, 1, COL_MUTED);
 }
 
+static void draw_text_right(uint16_t *buf, int by, int bh, int x_right, int y, const char *s,
+                            int scale, uint16_t color)
+{
+    int w = (int)strlen(s) * 8 * scale;
+    draw_text(buf, by, bh, x_right - w, y, s, scale, color);
+}
+
+static void draw_graph(uint16_t *buf, int by, int bh)
+{
+    const int gx = 10;
+    const int gy = 194;
+    const int gw = 220;
+    const int gh = 80;
+
+    if (by + bh <= gy || by >= gy + gh) {
+        return;
+    }
+
+    const int px = 44;       // plot area, leaves room for the ppm labels
+    const int py = 200;
+    const int pw = 182;
+    const int ph = 58;
+
+    fill_rect(buf, by, bh, gx, gy, gw, 1, COL_BORDER);
+    fill_rect(buf, by, bh, gx, gy + gh - 1, gw, 1, COL_BORDER);
+    fill_rect(buf, by, bh, gx, gy, 1, gh, COL_BORDER);
+    fill_rect(buf, by, bh, gx + gw - 1, gy, 1, gh, COL_BORDER);
+    fill_rect(buf, by, bh, px, py, pw, ph, COL_GRAPH_BG);
+
+    // horizontal reference lines: 800 and 1200 ppm
+    int y800 = py + ph - 1 - (800 - 400) * (ph - 1) / 1600;
+    int y1200 = py + ph - 1 - (1200 - 400) * (ph - 1) / 1600;
+    fill_rect(buf, by, bh, px, y800, pw, 1, COL_GRAPH_GRID);
+    fill_rect(buf, by, bh, px, y1200, pw, 1, COL_GRAPH_GRID);
+
+    // Y axis labels (right aligned, left of the plot)
+    static const uint16_t levels[] = {2000, 1200, 800, 400};
+    for (unsigned i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+        int ly = py + ph - 1 - ((int)levels[i] - 400) * (ph - 1) / 1600;
+        char lab[6];
+        snprintf(lab, sizeof(lab), "%u", (unsigned)levels[i]);
+        int ly_text = ly - 4;
+        if (ly_text < py - 2) {
+            ly_text = py - 2;
+        }
+        if (ly_text > py + ph - 6) {
+            ly_text = py + ph - 6;
+        }
+        draw_text_right(buf, by, bh, px - 4, ly_text, lab, 1, COL_MUTED);
+    }
+
+    // X axis labels: -4m / -2m / now
+    draw_text(buf, by, bh, px, py + ph + 4, "-4m", 1, COL_MUTED);
+    draw_text(buf, by, bh, px + pw / 2 - 12, py + ph + 4, "-2m", 1, COL_MUTED);
+    draw_text_right(buf, by, bh, px + pw, py + ph + 4, "now", 1, COL_MUTED);
+
+    if (g_hist_len == 0) {
+        return;
+    }
+
+    // The window is always 4 minutes wide: with fewer samples the line grows
+    // from the right edge, so the -4m/-2m/now labels stay truthful.
+    uint16_t line_color = co2_color(hist_get(g_hist_len - 1));
+
+    for (int i = 0; i < g_hist_len; i++) {
+        int x0 = (pw - 1) - (g_hist_len - 1 - i) * (pw - 1) / (GRAPH_SAMPLES - 1);
+        int x1 = (i + 1 < g_hist_len)
+                     ? (pw - 1) - (g_hist_len - 2 - i) * (pw - 1) / (GRAPH_SAMPLES - 1)
+                     : x0 + 1;
+
+        int ppm0 = (int)hist_get(i);
+        if (ppm0 < 400) {
+            ppm0 = 400;
+        }
+        if (ppm0 > 2000) {
+            ppm0 = 2000;
+        }
+        int y0 = py + ph - 1 - (ppm0 - 400) * (ph - 1) / 1600;
+
+        int y1 = y0;
+        if (i + 1 < g_hist_len) {
+            int ppm1 = (int)hist_get(i + 1);
+            if (ppm1 < 400) {
+                ppm1 = 400;
+            }
+            if (ppm1 > 2000) {
+                ppm1 = 2000;
+            }
+            y1 = py + ph - 1 - (ppm1 - 400) * (ph - 1) / 1600;
+        }
+
+        int span = x1 - x0;
+        if (span < 1) {
+            span = 1;
+        }
+        for (int x = x0; x <= x1 && x < pw; x++) {
+            int yv = y0 + (y1 - y0) * (x - x0) / span;
+            fill_rect(buf, by, bh, px + x, yv + 1, 1, (py + ph) - yv - 1, COL_GRAPH_FILL);
+            fill_rect(buf, by, bh, px + x, yv, 1, 2, line_color);
+        }
+    }
+}
+
 static void render_band(int by, int bh)
 {
     uint16_t *buf = g_band;
@@ -205,7 +332,7 @@ static void render_band(int by, int bh)
         xSemaphoreGive(g_meas_mutex);
     }
 
-    draw_text_center(buf, by, bh, 6, "AIR MONITOR", 1, COL_MUTED);
+    draw_text_center(buf, by, bh, 4, "AIR MONITOR", 1, COL_MUTED);
 
     // big CO2 number + unit
     char num[8];
@@ -218,14 +345,14 @@ static void render_band(int by, int bh)
     int num_w = (int)strlen(num) * 8 * 5;
     int ppm_w = 3 * 8;
     int x = (LCD_H_RES - (num_w + 8 + ppm_w)) / 2;
-    draw_text(buf, by, bh, x, 26, num, 5, color);
-    draw_text(buf, by, bh, x + num_w + 8, 54, "ppm", 1, COL_MUTED);
+    draw_text(buf, by, bh, x, 18, num, 5, color);
+    draw_text(buf, by, bh, x + num_w + 8, 46, "ppm", 1, COL_MUTED);
 
-    draw_text_center(buf, by, bh, 76, valid ? co2_status(m.co2_ppm) : "NO DATA", 2, color);
+    draw_text_center(buf, by, bh, 66, valid ? co2_status(m.co2_ppm) : "NO DATA", 2, color);
 
     // quality scale: 400 .. 2000 ppm
     int gx = 16;
-    int gy = 110;
+    int gy = 96;
     int gw = LCD_H_RES - 32;
     int gh = 10;
     fill_rect(buf, by, bh, gx, gy, gw / 4, gh, COL_OK);
@@ -247,11 +374,11 @@ static void render_band(int by, int bh)
     draw_text(buf, by, bh, gx + gw - 24, gy + 14, "2000", 1, COL_MUTED);
 
     // temperature and humidity cards
-    draw_card(buf, by, bh, 10, 146, 105, 88, "TEMP", m.temperature_c, valid, "C");
-    draw_card(buf, by, bh, 125, 146, 105, 88, "HUM", m.humidity_rh, valid, "%");
+    draw_card(buf, by, bh, 10, 126, 105, 64, "TEMP", m.temperature_c, valid, "C");
+    draw_card(buf, by, bh, 125, 126, 105, 64, "HUM", m.humidity_rh, valid, "%");
 
-    draw_text_center(buf, by, bh, 250, valid ? "SCD41  I2C 0x62" : "SENSOR OFFLINE", 1,
-                     COL_MUTED);
+    // trend graph
+    draw_graph(buf, by, bh);
 }
 
 static void draw_all(void)
@@ -324,6 +451,7 @@ static void sensor_task(void *arg)
                         xSemaphoreGive(g_meas_mutex);
                     }
                     g_ui_dirty = true;
+                    hist_push(m.co2_ppm);
                     printf("[scd] CO2 %u ppm, T %d.%d C, RH %d.%d %%\r\n", (unsigned)m.co2_ppm,
                            (int)m.temperature_c, (int)(m.temperature_c * 10) % 10,
                            (int)m.humidity_rh, (int)(m.humidity_rh * 10) % 10);
