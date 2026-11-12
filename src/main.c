@@ -49,6 +49,7 @@ volatile uint32_t g_scd_reads;
 volatile uint32_t g_scd_ok_reads;
 volatile uint32_t g_scd_stack_hw;
 volatile uint32_t g_lcd_stack_hw;
+volatile uint32_t g_sup_stack_hw;
 
 // ---------------------------------------------------------------------------
 // Colours (SWAP_BYTES because the panel expects big-endian RGB565)
@@ -461,6 +462,7 @@ static void supervisor_task(void *arg)
     uint32_t last_ok = g_scd_ok_reads;
     int scd_stall = 0;
     int no_data = 0;
+    int display_stall = 0;
 
     HAL_IWDG_Refresh(&hiwdg);
 
@@ -470,7 +472,13 @@ static void supervisor_task(void *arg)
         bool alive = true;
 
         if (g_lcd_bands == last_bands) {
-            alive = false;  // display task did not draw this second
+            // Allow a few seconds: the heartbeat and this check both run at 1 Hz
+            // and can drift out of phase.
+            if (++display_stall > 5) {
+                alive = false;
+            }
+        } else {
+            display_stall = 0;
         }
         last_bands = g_lcd_bands;
 
@@ -493,6 +501,16 @@ static void supervisor_task(void *arg)
             HAL_IWDG_Refresh(&hiwdg);
         }
         // Otherwise stop feeding and let the IWDG reset the MCU.
+
+        static int tick10;
+        if (++tick10 >= 10) {
+            tick10 = 0;
+            g_sup_stack_hw = uxTaskGetStackHighWaterMark(NULL);
+            printf("[sup] up %lus bands %lu scd %lu/%lu heap %u sup_hw %lu\r\n",
+                   (unsigned long)(xTaskGetTickCount() / 1000U), (unsigned long)g_lcd_bands,
+                   (unsigned long)g_scd_ok_reads, (unsigned long)g_scd_reads,
+                   (unsigned)xPortGetFreeHeapSize(), (unsigned long)g_sup_stack_hw);
+        }
     }
 }
 
@@ -743,6 +761,16 @@ int main(void)
     printf("SYSCLK %lu Hz, FreeRTOS %s\r\n", (unsigned long)SystemCoreClock,
            tskKERNEL_VERSION_NUMBER);
 
+    uint32_t csr = RCC->CSR;
+    printf("reset cause: %s%s%s%s%s%s\r\n",
+           (csr & RCC_CSR_PORRSTF) ? "POR " : "",
+           (csr & RCC_CSR_PINRSTF) ? "PIN " : "",
+           (csr & RCC_CSR_SFTRSTF) ? "SW " : "",
+           (csr & RCC_CSR_IWDGRSTF) ? "IWDG " : "",
+           (csr & RCC_CSR_WWDGRSTF) ? "WWDG " : "",
+           (csr & RCC_CSR_LPWRRSTF) ? "LPWR " : "");
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+
     // 3 quick blinks: proof of life before the scheduler starts.
     for (int i = 0; i < 3; i++) {
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
@@ -758,7 +786,7 @@ int main(void)
 
     xTaskCreate(display_task, "lcd", 320, NULL, 2, NULL);
     xTaskCreate(sensor_task, "scd", 384, NULL, 3, NULL);
-    xTaskCreate(supervisor_task, "sup", 128, NULL, 1, NULL);
+    xTaskCreate(supervisor_task, "sup", 256, NULL, 1, NULL);
 
     // IWDG last: ~4 s at LSI 40 kHz, frozen while the core is halted by a
     // debugger so SWD inspection does not reset the board.
