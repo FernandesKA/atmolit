@@ -9,3 +9,8 @@
 void lcd_init(void);
 void lcd_draw_band(int y, int h, const uint16_t *pixels);
 void lcd_fill(uint16_t color);
+
+// Diagnostics, readable through SWD.
+extern volatile uint32_t g_lcd_spi_ok;
+extern volatile uint32_t g_lcd_spi_err;
+extern volatile uint32_t g_lcd_bands;

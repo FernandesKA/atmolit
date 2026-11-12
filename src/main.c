@@ -43,6 +43,13 @@ static bool g_sensor_ok;
 static bool g_meas_valid;
 static scd41_measurement_t g_meas;
 
+// Watchdog and liveness counters (readable through SWD).
+static IWDG_HandleTypeDef hiwdg;
+volatile uint32_t g_scd_reads;
+volatile uint32_t g_scd_ok_reads;
+volatile uint32_t g_scd_stack_hw;
+volatile uint32_t g_lcd_stack_hw;
+
 // ---------------------------------------------------------------------------
 // Colours (SWAP_BYTES because the panel expects big-endian RGB565)
 // ---------------------------------------------------------------------------
@@ -437,6 +444,55 @@ static void display_task(void *arg)
             lcd_draw_band(0, LCD_BAND_LINES, g_band);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+        g_lcd_stack_hw = uxTaskGetStackHighWaterMark(NULL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog supervisor: feeds the IWDG only while both worker tasks progress.
+// No heartbeat from the display task, or no sensor poll for 20 s, stops the
+// feeding and the IWDG resets the MCU in ~4 s.
+// ---------------------------------------------------------------------------
+static void supervisor_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_bands = g_lcd_bands;
+    uint32_t last_reads = g_scd_reads;
+    uint32_t last_ok = g_scd_ok_reads;
+    int scd_stall = 0;
+    int no_data = 0;
+
+    HAL_IWDG_Refresh(&hiwdg);
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        bool alive = true;
+
+        if (g_lcd_bands == last_bands) {
+            alive = false;  // display task did not draw this second
+        }
+        last_bands = g_lcd_bands;
+
+        if (g_scd_reads != last_reads) {
+            last_reads = g_scd_reads;
+            scd_stall = 0;
+        } else if (++scd_stall > 20) {
+            alive = false;  // no sensor attempt for 20 s
+        }
+
+        // Sensor detected but no fresh data for 60 s: I2C is wedged, reboot.
+        if (g_scd_ok_reads != last_ok) {
+            last_ok = g_scd_ok_reads;
+            no_data = 0;
+        } else if (g_sensor_ok && ++no_data > 60) {
+            alive = false;
+        }
+
+        if (alive) {
+            HAL_IWDG_Refresh(&hiwdg);
+        }
+        // Otherwise stop feeding and let the IWDG reset the MCU.
     }
 }
 
@@ -468,17 +524,30 @@ static void sensor_task(void *arg)
                     }
                     g_ui_dirty = true;
                     hist_push(m.co2_ppm);
+                    g_scd_ok_reads++;
                     printf("[scd] CO2 %u ppm, T %d.%d C, RH %d.%d %%\r\n", (unsigned)m.co2_ppm,
                            (int)m.temperature_c, (int)(m.temperature_c * 10) % 10,
                            (int)m.humidity_rh, (int)(m.humidity_rh * 10) % 10);
                 } else {
                     printf("[scd] read failed\r\n");
+                    // A stuck bus can hold SDA low; re-init the peripheral.
+                    static int fails;
+                    if (++fails >= 3) {
+                        fails = 0;
+                        printf("[scd] I2C stuck, re-initialising\r\n");
+                        HAL_I2C_DeInit(&hi2c1);
+                        HAL_I2C_Init(&hi2c1);
+                    }
                 }
+                g_scd_reads++;
+                g_scd_stack_hw = uxTaskGetStackHighWaterMark(NULL);
             }
         }
 
         g_sensor_ok = false;
         printf("[scd] sensor not found on I2C1 (PB6/PB7), retrying\r\n");
+        g_scd_reads++;
+        g_scd_stack_hw = uxTaskGetStackHighWaterMark(NULL);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
@@ -688,7 +757,18 @@ int main(void)
     }
 
     xTaskCreate(display_task, "lcd", 320, NULL, 2, NULL);
-    xTaskCreate(sensor_task, "scd", 288, NULL, 3, NULL);
+    xTaskCreate(sensor_task, "scd", 384, NULL, 3, NULL);
+    xTaskCreate(supervisor_task, "sup", 128, NULL, 1, NULL);
+
+    // IWDG last: ~4 s at LSI 40 kHz, frozen while the core is halted by a
+    // debugger so SWD inspection does not reset the board.
+    __HAL_DBGMCU_FREEZE_IWDG();
+    hiwdg.Instance = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_64;
+    hiwdg.Init.Reload = 2500;
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+        Error_Handler();
+    }
 
     vTaskStartScheduler();
 
