@@ -1,5 +1,10 @@
 #include "lcd_st7789.h"
 
+#include <stdbool.h>
+
+#include "FreeRTOS.h"
+#include "semphr.h"
+
 #include "board.h"
 #include "stm32f1xx_hal.h"
 
@@ -17,6 +22,70 @@ static void cs_high(void)
 volatile uint32_t g_lcd_spi_ok;
 volatile uint32_t g_lcd_spi_err;
 volatile uint32_t g_lcd_bands;
+
+// ---------------------------------------------------------------------------
+// DMA for SPI1_TX: DMA1 Channel 3
+// ---------------------------------------------------------------------------
+static DMA_HandleTypeDef s_hdma_tx;
+static SemaphoreHandle_t s_dma_done;
+static volatile bool s_dma_error;
+static volatile bool s_dma_inited;
+
+static void lcd_dma_init(void)
+{
+    if (s_dma_inited) {
+        return;
+    }
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    s_hdma_tx.Instance = DMA1_Channel3;
+    s_hdma_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    s_hdma_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    s_hdma_tx.Init.MemInc = DMA_MINC_ENABLE;
+    s_hdma_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    s_hdma_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    s_hdma_tx.Init.Mode = DMA_NORMAL;
+    s_hdma_tx.Init.Priority = DMA_PRIORITY_HIGH;
+    HAL_DMA_Init(&s_hdma_tx);
+    __HAL_LINKDMA(&hspi1, hdmatx, s_hdma_tx);
+
+    // Priority 5 = configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY, so the ISR may
+    // call the FreeRTOS FromISR API.
+    HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+    HAL_NVIC_SetPriority(SPI1_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(SPI1_IRQn);
+
+    s_dma_done = xSemaphoreCreateBinary();
+    s_dma_inited = true;
+}
+
+void DMA1_Channel3_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&s_hdma_tx);
+}
+
+void SPI1_IRQHandler(void)
+{
+    HAL_SPI_IRQHandler(&hspi1);
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    (void)hspi;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_dma_done, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    (void)hspi;
+    s_dma_error = true;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_dma_done, &woken);
+    portYIELD_FROM_ISR(woken);
+}
 
 static void lcd_cmd(uint8_t cmd)
 {
@@ -68,6 +137,8 @@ static void lcd_set_window(int x0, int y0, int x1, int y1)
 
 void lcd_init(void)
 {
+    lcd_dma_init();
+
     // Hardware reset
     HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_RST_PIN, GPIO_PIN_RESET);
     HAL_Delay(20);
@@ -141,12 +212,27 @@ void lcd_draw_band(int y, int h, const uint16_t *pixels)
     lcd_set_window(0, y, LCD_H_RES - 1, y + h - 1);
     HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_DC_PIN, GPIO_PIN_SET);
     cs_low();
-    if (HAL_SPI_Transmit(&LCD_SPI_HANDLE, (uint8_t *)pixels,
-                         (uint16_t)(LCD_H_RES * h * sizeof(uint16_t)), 1000) == HAL_OK) {
+
+    uint16_t len = (uint16_t)(LCD_H_RES * h * sizeof(uint16_t));
+    bool ok = false;
+    s_dma_error = false;
+    if (HAL_SPI_Transmit_DMA(&LCD_SPI_HANDLE, (uint8_t *)pixels, len) == HAL_OK) {
+        if (xSemaphoreTake(s_dma_done, pdMS_TO_TICKS(100)) == pdTRUE && !s_dma_error) {
+            ok = true;
+        }
+    }
+    if (ok) {
         g_lcd_spi_ok++;
     } else {
         g_lcd_spi_err++;
+        HAL_SPI_Abort(&LCD_SPI_HANDLE);
     }
+
+    // Make sure the last bit is out before releasing CS.
+    uint32_t t0 = HAL_GetTick();
+    while ((hspi1.Instance->SR & SPI_SR_BSY) != 0U && (HAL_GetTick() - t0) < 5U) {
+    }
+
     cs_high();
     g_lcd_bands++;
 }

@@ -129,6 +129,7 @@ static void draw_text_center(uint16_t *buf, int by, int bh, int y, const char *s
 // Dashboard
 // ---------------------------------------------------------------------------
 static volatile bool g_ui_dirty = true;
+static bool g_live_dot;
 
 // CO2 history for the trend graph: 48 samples x 5 s = 4 minutes.
 #define GRAPH_SAMPLES 48
@@ -334,6 +335,11 @@ static void render_band(int by, int bh)
 
     draw_text_center(buf, by, bh, 4, "AIR MONITOR", 1, COL_MUTED);
 
+    // 1 Hz heartbeat dot, top-right corner
+    if (g_live_dot) {
+        fill_rect(buf, by, bh, LCD_H_RES - 10, 0, 4, 4, COL_OK);
+    }
+
     // big CO2 number + unit
     char num[8];
     if (valid) {
@@ -402,7 +408,12 @@ static void display_task(void *arg)
     const uint16_t colors[] = {COL_RED, COL_GREEN, COL_BLUE, COL_WHITE, COL_BLACK};
     unsigned idx = 0;
     for (;;) {
-        lcd_fill(colors[idx]);
+        for (int y = 0; y < LCD_V_RES; y += LCD_BAND_LINES) {
+            for (int i = 0; i < LCD_H_RES * LCD_BAND_LINES; i++) {
+                g_band[i] = colors[idx];
+            }
+            lcd_draw_band(y, LCD_BAND_LINES, g_band);
+        }
         idx = (idx + 1) % (sizeof(colors) / sizeof(colors[0]));
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -417,8 +428,13 @@ static void display_task(void *arg)
             g_ui_dirty = false;
             draw_all();
         }
-        if (++ticks % 5 == 0) {
+        if (++ticks % 10 == 0) {
+            // 1 Hz heartbeat: a dot in the header and the LED. This also proves
+            // that the panel is still accepting data between sensor samples.
+            g_live_dot = !g_live_dot;
             HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            render_band(0, LCD_BAND_LINES);
+            lcd_draw_band(0, LCD_BAND_LINES, g_band);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -566,7 +582,7 @@ static void SPI1_Init(void)
 
     hspi1.Instance = SPI1;
     hspi1.Init.Mode = SPI_MODE_MASTER;
-    hspi1.Init.Direction = SPI_DIRECTION_1LINE;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
     hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
     hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;

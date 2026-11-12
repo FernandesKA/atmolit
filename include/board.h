@@ -36,8 +36,9 @@ extern UART_HandleTypeDef huart1;
 // Bring-up test: full-screen colour cycling, ignores the UI.
 #define LCD_SELF_TEST_COLORS 0
 
-// SPI1 = 36 MHz at 72 MHz APB2 (maximum for STM32F1).
-#define LCD_SPI_PRESCALER SPI_BAUDRATEPRESCALER_2
+// SPI1 = 9 MHz at 72 MHz APB2 (divide by 8). 36 MHz works with blocking SPI,
+// 18 MHz still locks up the panel after a while on jumper wires; 9 MHz is safe.
+#define LCD_SPI_PRESCALER SPI_BAUDRATEPRESCALER_8
 
 // Off-screen band buffer: 240 x 4 x 2 = 1920 bytes. The "C8" clones very often
 // carry a C6 die with only 10 KB of SRAM, so the budget is tight.
