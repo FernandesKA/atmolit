@@ -1,0 +1,171 @@
+#include "lcd_st7789.h"
+
+#include "board.h"
+#include "stm32f1xx_hal.h"
+
+static void cs_low(void)
+{
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_CS_PIN, GPIO_PIN_RESET);
+}
+
+static void cs_high(void)
+{
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_CS_PIN, GPIO_PIN_SET);
+}
+
+// Diagnostics readable through SWD.
+volatile uint32_t g_lcd_spi_ok;
+volatile uint32_t g_lcd_spi_err;
+volatile uint32_t g_lcd_bands;
+
+static void lcd_cmd(uint8_t cmd)
+{
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_DC_PIN, GPIO_PIN_RESET);
+    cs_low();
+    HAL_SPI_Transmit(&LCD_SPI_HANDLE, &cmd, 1, 100);
+    cs_high();
+}
+
+static void lcd_data(const uint8_t *data, uint16_t len)
+{
+    if (len == 0) {
+        return;
+    }
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_DC_PIN, GPIO_PIN_SET);
+    cs_low();
+    HAL_SPI_Transmit(&LCD_SPI_HANDLE, (uint8_t *)data, len, 1000);
+    cs_high();
+}
+
+static void lcd_cmd_data(uint8_t cmd, const uint8_t *data, uint16_t len)
+{
+    lcd_cmd(cmd);
+    lcd_data(data, len);
+}
+
+static void lcd_set_window(int x0, int y0, int x1, int y1)
+{
+    x0 += LCD_GAP_X;
+    x1 += LCD_GAP_X;
+    y0 += LCD_GAP_Y;
+    y1 += LCD_GAP_Y;
+
+    uint8_t buf[4];
+    buf[0] = (uint8_t)(x0 >> 8);
+    buf[1] = (uint8_t)x0;
+    buf[2] = (uint8_t)(x1 >> 8);
+    buf[3] = (uint8_t)x1;
+    lcd_cmd_data(0x2A, buf, 4);  // CASET
+
+    buf[0] = (uint8_t)(y0 >> 8);
+    buf[1] = (uint8_t)y0;
+    buf[2] = (uint8_t)(y1 >> 8);
+    buf[3] = (uint8_t)y1;
+    lcd_cmd_data(0x2B, buf, 4);  // RASET
+
+    lcd_cmd(0x2C);  // RAMWR
+}
+
+void lcd_init(void)
+{
+    // Hardware reset
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_RST_PIN, GPIO_PIN_RESET);
+    HAL_Delay(20);
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_RST_PIN, GPIO_PIN_SET);
+    HAL_Delay(120);
+
+    lcd_cmd(0x01);  // SWRESET
+    HAL_Delay(150);
+
+    lcd_cmd(0x11);  // SLPOUT
+    HAL_Delay(120);
+
+    static const uint8_t colmod[] = {0x55};  // 16 bit/pixel
+    lcd_cmd_data(0x3A, colmod, sizeof(colmod));
+
+    static const uint8_t madctl[] = {0x00};  // no mirror, RGB order
+    lcd_cmd_data(0x36, madctl, sizeof(madctl));
+
+    static const uint8_t porctrl[] = {0x0C, 0x0C, 0x00, 0x33, 0x33};
+    lcd_cmd_data(0xB2, porctrl, sizeof(porctrl));
+
+    static const uint8_t gctrl[] = {0x35};
+    lcd_cmd_data(0xB7, gctrl, sizeof(gctrl));
+
+    static const uint8_t vcoms[] = {0x19};
+    lcd_cmd_data(0xBB, vcoms, sizeof(vcoms));
+
+    static const uint8_t lcmctrl[] = {0x2C};
+    lcd_cmd_data(0xC0, lcmctrl, sizeof(lcmctrl));
+
+    static const uint8_t vdvvrhen[] = {0x01};
+    lcd_cmd_data(0xC2, vdvvrhen, sizeof(vdvvrhen));
+
+    static const uint8_t vrhs[] = {0x12};
+    lcd_cmd_data(0xC3, vrhs, sizeof(vrhs));
+
+    static const uint8_t vdvs[] = {0x20};
+    lcd_cmd_data(0xC4, vdvs, sizeof(vdvs));
+
+    static const uint8_t frctrl2[] = {0x0F};
+    lcd_cmd_data(0xC6, frctrl2, sizeof(frctrl2));
+
+    static const uint8_t pwctrl1[] = {0xA4, 0xA1};
+    lcd_cmd_data(0xD0, pwctrl1, sizeof(pwctrl1));
+
+    static const uint8_t pgamma[] = {0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F,
+                                     0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23};
+    lcd_cmd_data(0xE0, pgamma, sizeof(pgamma));
+
+    static const uint8_t ngamma[] = {0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F,
+                                     0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23};
+    lcd_cmd_data(0xE1, ngamma, sizeof(ngamma));
+
+    if (LCD_INVERT_COLOR) {
+        lcd_cmd(0x21);  // INVON
+    } else {
+        lcd_cmd(0x20);  // INVOFF
+    }
+
+    lcd_cmd(0x13);  // NORON
+    HAL_Delay(10);
+    lcd_cmd(0x29);  // DISPON
+    HAL_Delay(100);
+}
+
+void lcd_draw_band(int y, int h, const uint16_t *pixels)
+{
+    if (h <= 0) {
+        return;
+    }
+    lcd_set_window(0, y, LCD_H_RES - 1, y + h - 1);
+    HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_DC_PIN, GPIO_PIN_SET);
+    cs_low();
+    if (HAL_SPI_Transmit(&LCD_SPI_HANDLE, (uint8_t *)pixels,
+                         (uint16_t)(LCD_H_RES * h * sizeof(uint16_t)), 1000) == HAL_OK) {
+        g_lcd_spi_ok++;
+    } else {
+        g_lcd_spi_err++;
+    }
+    cs_high();
+    g_lcd_bands++;
+}
+
+void lcd_fill(uint16_t color)
+{
+    static uint16_t line[LCD_H_RES];
+    for (int i = 0; i < LCD_H_RES; i++) {
+        line[i] = color;
+    }
+    for (int y = 0; y < LCD_V_RES; y += LCD_BAND_LINES) {
+        int h = (y + LCD_BAND_LINES > LCD_V_RES) ? (LCD_V_RES - y) : LCD_BAND_LINES;
+        lcd_set_window(0, y, LCD_H_RES - 1, y + h - 1);
+        HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_DC_PIN, GPIO_PIN_SET);
+        cs_low();
+        for (int r = 0; r < h; r++) {
+            HAL_SPI_Transmit(&LCD_SPI_HANDLE, (uint8_t *)line,
+                             (uint16_t)(LCD_H_RES * sizeof(uint16_t)), 1000);
+        }
+        cs_high();
+    }
+}
