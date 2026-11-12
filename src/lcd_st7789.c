@@ -26,6 +26,7 @@ volatile uint32_t g_lcd_bands;
 // ---------------------------------------------------------------------------
 // DMA for SPI1_TX: DMA1 Channel 3
 // ---------------------------------------------------------------------------
+#if LCD_USE_DMA
 static DMA_HandleTypeDef s_hdma_tx;
 static SemaphoreHandle_t s_dma_done;
 static volatile bool s_dma_error;
@@ -86,6 +87,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
     xSemaphoreGiveFromISR(s_dma_done, &woken);
     portYIELD_FROM_ISR(woken);
 }
+#endif  // LCD_USE_DMA
 
 static void lcd_cmd(uint8_t cmd)
 {
@@ -137,7 +139,9 @@ static void lcd_set_window(int x0, int y0, int x1, int y1)
 
 void lcd_init(void)
 {
+#if LCD_USE_DMA
     lcd_dma_init();
+#endif
 
     // Hardware reset
     HAL_GPIO_WritePin(LCD_GPIO_PORT, LCD_RST_PIN, GPIO_PIN_RESET);
@@ -214,6 +218,8 @@ void lcd_draw_band(int y, int h, const uint16_t *pixels)
     cs_low();
 
     uint16_t len = (uint16_t)(LCD_H_RES * h * sizeof(uint16_t));
+
+#if LCD_USE_DMA
     bool ok = false;
     s_dma_error = false;
     if (HAL_SPI_Transmit_DMA(&LCD_SPI_HANDLE, (uint8_t *)pixels, len) == HAL_OK) {
@@ -221,16 +227,22 @@ void lcd_draw_band(int y, int h, const uint16_t *pixels)
             ok = true;
         }
     }
-    if (ok) {
-        g_lcd_spi_ok++;
-    } else {
-        g_lcd_spi_err++;
+    if (!ok) {
         HAL_SPI_Abort(&LCD_SPI_HANDLE);
     }
 
     // Make sure the last bit is out before releasing CS.
     uint32_t t0 = HAL_GetTick();
     while ((hspi1.Instance->SR & SPI_SR_BSY) != 0U && (HAL_GetTick() - t0) < 5U) {
+    }
+#else
+    bool ok = (HAL_SPI_Transmit(&LCD_SPI_HANDLE, (uint8_t *)pixels, len, 1000) == HAL_OK);
+#endif
+
+    if (ok) {
+        g_lcd_spi_ok++;
+    } else {
+        g_lcd_spi_err++;
     }
 
     cs_high();

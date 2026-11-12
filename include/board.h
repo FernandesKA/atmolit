@@ -36,9 +36,15 @@ extern UART_HandleTypeDef huart1;
 // Bring-up test: full-screen colour cycling, ignores the UI.
 #define LCD_SELF_TEST_COLORS 0
 
-// SPI1 = 9 MHz at 72 MHz APB2 (divide by 8). 36 MHz works with blocking SPI,
-// 18 MHz still locks up the panel after a while on jumper wires; 9 MHz is safe.
-#define LCD_SPI_PRESCALER SPI_BAUDRATEPRESCALER_8
+// 0 = blocking HAL_SPI_Transmit (checked, stable), 1 = DMA1 Channel 3.
+// The DMA path is implemented and works, but on this panel/wiring it locks up
+// after a while, so it is off by default.
+#define LCD_USE_DMA 0
+
+// SPI1 = 36 MHz at 72 MHz APB2 (divide by 2). With blocking transfers this is
+// reliable; with DMA the panel locked up at 36 and 18 MHz, use prescaler 4/8
+// there.
+#define LCD_SPI_PRESCALER SPI_BAUDRATEPRESCALER_2
 
 // Off-screen band buffer: 240 x 4 x 2 = 1920 bytes. The "C8" clones very often
 // carry a C6 die with only 10 KB of SRAM, so the budget is tight.
